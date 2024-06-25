@@ -246,12 +246,8 @@ impl Time {
     /// let d = Time::from_timestamp(3740, 123).unwrap();
     /// assert_eq!(d.to_string(), "01:02:20.000123");
     /// ```
-    pub fn from_timestamp(timestamp_second: u32, timestamp_microsecond: u32) -> Result<Self, ParseError> {
-        Time::from_timestamp_with_config(
-            timestamp_second,
-            timestamp_microsecond,
-            &TimeConfigBuilder::new().build(),
-        )
+    pub fn from_timestamp(timestamp: i64, timestamp_microsecond: u32) -> Result<Self, ParseError> {
+        Self::from_timestamp_with_config(timestamp, timestamp_microsecond, &TimeConfigBuilder::new().build())
     }
 
     /// Like `from_timestamp` but with a `TimeConfig`
@@ -273,26 +269,40 @@ impl Time {
     /// assert_eq!(d.to_string(), "01:02:20.000123");
     /// ```
     pub fn from_timestamp_with_config(
-        timestamp_second: u32,
+        timestamp: i64,
         timestamp_microsecond: u32,
         config: &TimeConfig,
     ) -> Result<Self, ParseError> {
-        let mut second = timestamp_second;
-        let mut microsecond = timestamp_microsecond;
-        if microsecond >= 1_000_000 {
-            second = second
-                .checked_add(microsecond / 1_000_000)
-                .ok_or(ParseError::TimeTooLarge)?;
-            microsecond %= 1_000_000;
-        }
-        if second >= 86_400 {
+        let (seconds, additional_microseconds) = match config.timestamp_interpretation {
+            TimestampInterpretation::Auto => {
+                if timestamp.abs() > 20_000_000_000 {
+                    (timestamp / 1000, ((timestamp % 1000) * 1000) as u32)
+                } else {
+                    (timestamp, 0)
+                }
+            }
+            TimestampInterpretation::AlwaysSeconds => (timestamp, 0),
+        };
+
+        let total_microseconds = timestamp_microsecond.saturating_add(additional_microseconds);
+        let additional_seconds = total_microseconds / 1_000_000;
+        let final_microseconds = total_microseconds % 1_000_000;
+
+        let total_seconds = seconds
+            .checked_add(additional_seconds as i64)
+            .ok_or(ParseError::TimeTooLarge)?;
+
+        if !(0..86_400).contains(&total_seconds) {
             return Err(ParseError::TimeTooLarge);
         }
+
+        let total_seconds = total_seconds as u32;
+
         Ok(Self {
-            hour: (second / 3600) as u8,
-            minute: ((second % 3600) / 60) as u8,
-            second: (second % 60) as u8,
-            microsecond,
+            hour: (total_seconds / 3600) as u8,
+            minute: ((total_seconds % 3600) / 60) as u8,
+            second: (total_seconds % 60) as u8,
+            microsecond: final_microseconds,
             tz_offset: config.unix_timestamp_offset,
         })
     }
@@ -442,16 +452,16 @@ impl Time {
     /// let t1 = Time::parse_str("15:00:00Z").unwrap();
     ///
     /// let t2 = t1.in_timezone(7200).unwrap();
-    // / assert_eq!(t2.to_string(), "17:00:00+02:00");
+    /// assert_eq!(t2.to_string(), "17:00:00+02:00");
     /// ```
     pub fn in_timezone(&self, tz_offset: i32) -> Result<Self, ParseError> {
         if tz_offset.abs() >= 24 * 3600 {
             Err(ParseError::OutOfRangeTz)
         } else if let Some(current_offset) = self.tz_offset {
             let offset = tz_offset - current_offset;
-            let seconds = self.total_seconds().saturating_add_signed(offset);
+            let seconds = self.total_seconds().saturating_add_signed(offset) as i64;
             let mut time = Self::from_timestamp(seconds, self.microsecond)?;
-            time.tz_offset = Some(offset);
+            time.tz_offset = Some(tz_offset);
             Ok(time)
         } else {
             Err(ParseError::TzRequired)
@@ -587,28 +597,61 @@ impl TryFrom<&str> for MicrosecondsPrecisionOverflowBehavior {
     }
 }
 
+/// Defines how timestamps should be interpreted
+#[derive(Debug, Clone, Default, Copy, PartialEq)]
+pub enum TimestampInterpretation {
+    /// Automatically determine if the timestamp is in seconds or milliseconds
+    /// based on its value (default behavior)
+    #[default]
+    Auto,
+    /// Always interpret timestamps as seconds, regardless of their value
+    AlwaysSeconds,
+}
+
+impl TryFrom<&str> for TimestampInterpretation {
+    type Error = ConfigError;
+    fn try_from(value: &str) -> Result<Self, ConfigError> {
+        match value.to_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "always_seconds" => Ok(Self::AlwaysSeconds),
+            _ => Err(ConfigError::UnknownTimestampInterpretationString),
+        }
+    }
+}
+
+/// Configuration options for time parsing and handling
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TimeConfig {
+    /// Defines how to handle microsecond precision overflow
     pub microseconds_precision_overflow_behavior: MicrosecondsPrecisionOverflowBehavior,
+    /// Optional timezone offset for Unix timestamps
     pub unix_timestamp_offset: Option<i32>,
+    /// Defines how timestamps should be interpreted
+    pub timestamp_interpretation: TimestampInterpretation,
 }
 
 impl TimeConfig {
+    /// Creates a new TimeConfigBuilder
     pub fn builder() -> TimeConfigBuilder {
         TimeConfigBuilder::new()
     }
 }
 
+/// Builder for TimeConfig
 #[derive(Debug, Clone, Default)]
 pub struct TimeConfigBuilder {
     microseconds_precision_overflow_behavior: Option<MicrosecondsPrecisionOverflowBehavior>,
     unix_timestamp_offset: Option<i32>,
+    timestamp_interpretation: Option<TimestampInterpretation>,
 }
 
 impl TimeConfigBuilder {
+    /// Creates a new TimeConfigBuilder with default values
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Sets the microseconds precision overflow behavior
     pub fn microseconds_precision_overflow_behavior(
         mut self,
         microseconds_precision_overflow_behavior: MicrosecondsPrecisionOverflowBehavior,
@@ -616,14 +659,41 @@ impl TimeConfigBuilder {
         self.microseconds_precision_overflow_behavior = Some(microseconds_precision_overflow_behavior);
         self
     }
+
+    /// Sets the Unix timestamp offset
     pub fn unix_timestamp_offset(mut self, unix_timestamp_offset: Option<i32>) -> Self {
         self.unix_timestamp_offset = unix_timestamp_offset;
         self
     }
+
+    /// Sets the timestamp interpretation behavior
+    ///
+    /// # Arguments
+    ///
+    /// * `timestamp_interpretation` - The TimestampInterpretation to use
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use speedate::{TimeConfigBuilder, TimestampInterpretation};
+    ///
+    /// let config = TimeConfigBuilder::new()
+    ///     .timestamp_interpretation(TimestampInterpretation::AlwaysSeconds)
+    ///     .build();
+    ///
+    /// assert_eq!(config.timestamp_interpretation, TimestampInterpretation::AlwaysSeconds);
+    /// ```
+    pub fn timestamp_interpretation(mut self, timestamp_interpretation: TimestampInterpretation) -> Self {
+        self.timestamp_interpretation = Some(timestamp_interpretation);
+        self
+    }
+
+    /// Builds the TimeConfig from the builder
     pub fn build(self) -> TimeConfig {
         TimeConfig {
             microseconds_precision_overflow_behavior: self.microseconds_precision_overflow_behavior.unwrap_or_default(),
             unix_timestamp_offset: self.unix_timestamp_offset,
+            timestamp_interpretation: self.timestamp_interpretation.unwrap_or_default(),
         }
     }
 }
